@@ -9,6 +9,7 @@ setup(
         'click',
         'requests',
         'tabulate',
+        'pyaml',
     ],
     entry_points='''
         [console_scripts]
