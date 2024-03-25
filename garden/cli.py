@@ -5,8 +5,10 @@ import os
 import yaml
 from tabulate import tabulate
 from datetime import datetime, timezone
+from functools import reduce
+import operator
 
-API_BASE_URL = 'http://192.168.101.14:8500'  # Adjust the base URL as needed
+API_BASE_URL = 'http://192.168.101.5:8500'  # Adjust the base URL as needed
 
 @click.group()
 def cli():
@@ -17,7 +19,7 @@ def cli():
 @click.argument('plant_id', type=int, required=False)
 def list_plants(plant_id=None):
     """List all plants or a single plant by ID."""
-    url = f'{API_BASE_URL}/available/' if plant_id else f'{API_BASE_URL}/plants/'
+    url = f'{API_BASE_URL}/plants/{plant_id}/' if plant_id else f'{API_BASE_URL}/plants/'
     response = requests.get(url)
     data = response.json()
 
@@ -25,61 +27,69 @@ def list_plants(plant_id=None):
 
     table = []
     for plant in plants:
-        collect = 'YES' if plant['collect'] == 1 else 'NO'
-        if plant['status'] == 1:
-            status = click.style('ALIVE', fg='cyan')
-        else:
-            status = click.style('DEAD', fg='magenta')
+        # Determine the status display based on conditions
+        if plant['status'] == 'DOWN':
+            status = click.style(plant['status'], fg='red')
+        elif plant['status'] == 'STOP':
+            status = click.style(plant['status'], fg='yellow')
+        elif plant['status'] == 'ONLINE':
+            status = click.style(plant['status'], fg='cyan')
 
-        last_status_change = datetime.fromisoformat(plant['last_status_change'].replace('Z', '+00:00'))
-        last_status_change = last_status_change.replace(tzinfo=timezone.utc)
+        # Use the provided 'since' value from the API
+        since_str = plant['since']
 
-        time_since_change = datetime.utcnow().replace(tzinfo=timezone.utc) - last_status_change
+        table.append([plant['id'], plant['name'], plant['number_of_packages'], plant['number_of_fields'], status, since_str])
 
-        since = int(time_since_change.total_seconds())
-        if since < 60:
-            since_str = f"{since} S"
-        elif since < 3600:
-            since_str = f"{since // 60} M"
-        elif since < 86400:
-            since_str = f"{since // 3600} H"
-        else:
-            since_str = f"{since // 86400} D"
-
-        table.append([plant['id'], plant['name'], plant.get('picks_count', 0), collect, status, since_str])
-
-    headers = ['ID', 'NAME', 'PICKS', 'COLLECT', 'STATUS', 'SINCE']
+    headers = ['ID', 'NAME', 'WORKERS', 'FIELDS', 'STATUS', 'SINCE']
     click.echo(tabulate(table, headers=headers, tablefmt='plain'))
 
 @cli.command('add-plant')
 def add_plant():
-    """Add a new plant by interactively asking for each field."""
-    # Prompt for each field
-    name = click.prompt('Name', type=str)
-    description = click.prompt('Description', type=str)
-    full_query_command = click.prompt('Command', type=str)
+    """Add a new plant by asking for details and using the default text editor."""
+    # Ask for plant name and description
+    plant_name = click.prompt("Please enter the plant's name")
+    plant_description = click.prompt("Please enter the plant's description")
 
-    # Create a dictionary for the plant data
-    plant_data = {
-        "name": name,
-        "description": description,
-        "full_query_command": full_query_command
-        # 'collect' and 'status' will default to 0 and are not included here
+    # Open an empty temporary file in the default text editor for the command
+    with tempfile.NamedTemporaryFile(suffix=".txt", mode='w+', delete=False) as tf:
+        tf_path = tf.name
+
+    click.echo("Opening the default text editor for you to add the plant command...")
+    editor = os.environ.get('EDITOR', 'vim')  # Use EDITOR env variable or default to vim
+    os.system(f'{editor} "{tf_path}"')  # Open the editor to edit the command
+
+    # Read the command from the updated file
+    with open(tf_path, 'r') as tf:
+        plant_command = tf.read().strip()
+        print("comando:", plant_command)
+
+    os.unlink(tf_path)  # Clean up the temporary file
+
+    # Combine details into plant data
+    new_plant_data = {
+        "name": plant_name,
+        "description": plant_description,
+        "full_query_command": plant_command
     }
 
-    # Send a POST request to the API
+    # Check if any field is left blank
+    if not all(new_plant_data.values()):
+        click.echo("Some fields are left blank. Please fill in all fields. Operation cancelled.")
+        return
+
+    # Send a POST request to the API to add the new plant
     url = f'{API_BASE_URL}/plants/add/'
-    response = requests.post(url, json=plant_data)
+    response = requests.post(url, json=new_plant_data)
 
     if response.status_code in [200, 201]:
-        click.echo(f"Plant '{name}' added successfully.")
+        click.echo(f"Plant '{new_plant_data.get('name')}' added successfully.")
     else:
         click.echo(f"Failed to add plant. Status code: {response.status_code}, Response: {response.text}")
 
 @cli.command('edit-plant')
 @click.argument('plant_id', type=int)
 def edit_plant(plant_id):
-    """Edit details of a plant without changing its ID, collect status, or plant status."""
+    """Edit details of a plant without changing its ID, collect status, plant status, guid, or active status."""
     url = f'{API_BASE_URL}/plants/{plant_id}/'
     response = requests.get(url)
     if response.status_code != 200:
@@ -87,29 +97,40 @@ def edit_plant(plant_id):
         return
 
     plant_data = response.json()
-    original_collect = plant_data['collect']
-    original_status = plant_data['status']
 
-    # Remove non-editable fields from the editable template
-    excluded_fields = ['id', 'collect', 'status', 'last_status_change']  # Added 'last_status_change' to the exclusion list
-    editable_data = {key: plant_data[key] for key in plant_data if key not in excluded_fields}
+    # Prompt for new name and description, keep old if blank
+    new_name = click.prompt("Enter new plant name or press Enter to keep the current one", default=plant_data['name'], show_default=False)
+    new_description = click.prompt("Enter new plant description or press Enter to keep the current one", default=plant_data['description'], show_default=False)
 
-    with tempfile.NamedTemporaryFile(suffix=".yaml", mode='w+', delete=False) as tf:
-        yaml.dump(editable_data, tf, allow_unicode=True)
-        tf.flush()
-        click.echo("Opening Vim editor for you to edit plant details...")
-        os.system(f'vim {tf.name}')
-        tf.seek(0)
-        updated_plant_data = yaml.safe_load(tf)
+    # Use a temporary file for command editing
+    with tempfile.NamedTemporaryFile(suffix=".txt", mode='w+', delete=False) as tf:
+        tf.write(plant_data['full_query_command'])  # Pre-fill with the current command
+        tf.flush()  # Ensure all data is written to the file
+        tf_path = tf.name
 
-    os.unlink(tf.name)  # Clean up the temporary file
+    click.echo("Opening the default text editor for you to edit the plant command. Leave as is to keep the current command.")
+    editor = os.environ.get('EDITOR', 'vim')
+    os.system(f'{editor} "{tf_path}"')
 
-    # Reset non-editable fields to their original values
-    updated_plant_data['collect'] = original_collect
-    updated_plant_data['status'] = original_status
+    # Read the potentially updated command
+    with open(tf_path, 'r') as tf:
+        updated_command = tf.read().strip()
 
-    # Use PATCH instead of PUT for the update
-    update_response = requests.patch(url + 'update/', json=updated_plant_data)  # Adjusted to use PATCH and the correct endpoint
+    os.unlink(tf_path)  # Clean up the temporary file
+
+    # Encode the command to ensure it's safely transmitted
+    encoded_command = updated_command.encode('unicode_escape').decode('utf-8')
+
+    updated_plant_data = {
+        'name': new_name,
+        'description': new_description,
+        'full_query_command': encoded_command,  # Use the encoded command
+    }
+
+    headers = {'Content-Type': 'application/json'}
+
+    # Use PATCH to update the plant, ensuring to include the content-type header
+    update_response = requests.patch(url + 'update/', json=updated_plant_data, headers=headers)
     if update_response.status_code in [200, 204]:
         click.echo(f"Plant '{updated_plant_data.get('name')}' updated successfully.")
     else:
@@ -126,36 +147,275 @@ def remove_plant(plant_id):
     else:
         click.echo(f"Failed to remove plant ID {plant_id}. Status code: {response.status_code}, Response: {response.text}")
 
+@cli.command('list-actions')
+@click.argument('action_id', type=int, required=False)
+def list_actions(action_id=None):
+    """List all actions or a single action by ID."""
+    url = f'{API_BASE_URL}/actions/{action_id}/' if action_id else f'{API_BASE_URL}/actions/'
+    response = requests.get(url)
+    data = response.json()
+
+    actions = [data] if action_id else data
+
+    table = []
+    for action in actions:
+        params_count = len(action['params'])  # Get the count of parameters
+        status_display = 'ON' if action['status'] == 1 else 'OFF'  # Convert status to human-readable form
+
+        table.append([
+            action['id'],
+            action['group'],
+            action['name'],
+            params_count,  # Display the count of params here
+            status_display,
+            action['last_status_change']
+        ])
+
+    headers = ['ID', 'GROUP', 'NAME', 'PARAMS', 'STATUS', 'SINCE']  # Add 'PARAMS' to headers
+    click.echo(tabulate(table, headers=headers, tablefmt='plain'))
+
+@cli.command('add-action')
+def add_action():
+    """Add a new action by asking for details and allowing for individual parameter entry."""
+    action_group = click.prompt("Please enter the action's group")
+    action_name = click.prompt("Please enter the action's name")
+    action_description = click.prompt("Please enter the action's description")
+
+    action_params = []
+    param_index = 1
+    while True:
+        param = click.prompt(f"Enter Parameter N°{param_index} or press Enter to finish", default="", show_default=False)
+        if param == "":
+            break
+        action_params.append(param)
+        param_index += 1
+
+    # Open an empty temporary file in the default text editor for the action code
+    with tempfile.NamedTemporaryFile(suffix=".py", mode='w+', delete=False) as tf:
+        tf_path = tf.name
+
+    click.echo("Opening the default text editor for you to add the action code...")
+    editor = os.environ.get('EDITOR', 'vim')
+    os.system(f'{editor} "{tf_path}"')
+
+    # Read the code from the updated file
+    with open(tf_path, 'r') as tf:
+        action_code = tf.read().strip()
+
+    os.unlink(tf_path)  # Clean up the temporary file
+
+    # Combine details into action data
+    new_action_data = {
+        "group": action_group,
+        "name": action_name,
+        "description": action_description,
+        "params": action_params,
+        "code": action_code
+    }
+
+    # Send a POST request to the API to add the new action
+    url = f'{API_BASE_URL}/actions/'
+    response = requests.post(url, json=new_action_data)
+
+    if response.status_code in [200, 201]:
+        click.echo(f"Action '{new_action_data.get('name')}' added successfully.")
+    else:
+        click.echo(f"Failed to add action. Status code: {response.status_code}, Response: {response.text}")
+
+@cli.command('edit-action')
+@click.argument('action_id', type=int)
+def edit_action(action_id):
+    """Edit an existing action's details including parameters and code."""
+    # Fetch the existing action data
+    url = f'{API_BASE_URL}/actions/{action_id}/'
+    response = requests.get(url)
+    if response.status_code != 200:
+        click.echo(f"Failed to fetch action with ID {action_id}. Status code: {response.status_code}, Response: {response.text}")
+        return
+
+    action_data = response.json()
+
+    # Prompt for new values or use existing ones
+    new_group = click.prompt("Enter new action group or press Enter to keep the current one", default=action_data['group'], show_default=False)
+    new_name = click.prompt("Enter new action name or press Enter to keep the current one", default=action_data['name'], show_default=False)
+    new_description = click.prompt("Enter new action description or press Enter to keep the current one", default=action_data['description'], show_default=False)
+
+    # Edit existing parameters and possibly add new ones
+    new_params = []
+    for i, old_param in enumerate(action_data['params'], start=1):
+        new_param = click.prompt(f"Parameter N°{i} [{old_param}]: enter new param or press Enter to keep the current one", default=old_param, show_default=False)
+        new_params.append(new_param)
+
+    # Adding new parameters
+    while True:
+        new_param = click.prompt(f"Enter new parameter or press Enter if done (Parameter N°{len(new_params) + 1})", default="", show_default=False)
+        if not new_param:
+            break
+        new_params.append(new_param)
+
+    # Handling the action code
+    with tempfile.NamedTemporaryFile(suffix=".py", mode='w+', delete=False) as tf:
+        # Pre-fill the temp file with the existing action code
+        tf.write(action_data['code'])
+        tf.flush()
+        tf_path = tf.name
+
+    click.echo("Opening the default text editor for you to edit the action code. Leave as is to keep the current code.")
+    editor = os.environ.get('EDITOR', 'vim')
+    os.system(f'{editor} "{tf_path}"')
+
+    with open(tf_path, 'r') as tf:
+        updated_code = tf.read().strip()
+
+    os.unlink(tf_path)  # Clean up the temporary file
+
+    # Prepare the updated action data
+    updated_action_data = {
+        'group': new_group,
+        'name': new_name,
+        'description': new_description,
+        'params': new_params,
+        'code': updated_code,
+    }
+
+    # Send the update request to the API
+    update_response = requests.patch(url, json=updated_action_data)
+    if update_response.status_code in [200, 204]:
+        click.echo(f"Action '{updated_action_data.get('name')}' updated successfully.")
+    else:
+        click.echo(f"Failed to update action. Status code: {update_response.status_code}, Response: {update_response.text}")
+
+@cli.command('remove-action')
+@click.argument('action_id', type=int)
+def remove_action(action_id):
+    """Remove an action."""
+    url = f'{API_BASE_URL}/actions/{action_id}/'
+    response = requests.delete(url)
+    if response.status_code in [200, 204]:
+        click.echo(f"Action ID {action_id} removed successfully.")
+    else:
+        click.echo(f"Failed to remove action ID {action_id}. Status code: {response.status_code}, Response: {response.text}")
+
+@cli.command('execute-action')
+@click.argument('action_id', type=int)
+def execute_action(action_id):
+    """Execute an action by its ID with user-provided parameters."""
+    # Fetch the action details to get the required parameters
+    url = f'{API_BASE_URL}/actions/{action_id}/'
+    response = requests.get(url)
+    if response.status_code != 200:
+        click.echo(f"Failed to fetch action with ID {action_id}. Status code: {response.status_code}, Response: {response.text}")
+        return
+
+    action_data = response.json()
+    params = action_data['params']
+
+    # Prompt for parameter values
+    param_values = []
+    for i, param in enumerate(params, start=1):
+        value = click.prompt(f"Parameter N°{i} ({param})")
+        param_values.append(value)
+
+    # Construct the URL with parameters for the execution endpoint
+    params_query = ",".join(param_values)
+    execute_url = f'{API_BASE_URL}/actions/{action_id}/execute/?params={params_query}'
+
+    # Execute the action by sending a GET request to the execute URL
+    execute_response = requests.get(execute_url)
+    if execute_response.status_code == 200:
+        click.echo("Action executed successfully.")
+        click.echo(execute_response.text)
+    else:
+        click.echo(f"Failed to execute action. Status code: {execute_response.status_code}, Response: {execute_response.text}")
+
 @cli.command('watch-plant')
 @click.argument('plant_id', type=int, required=True)
 def watch_plant(plant_id):
     """Watch a specific plant by ID."""
-    url = f'{API_BASE_URL}/plants/{plant_id}/data/'
+    url = f'{API_BASE_URL}/plants/{plant_id}/'
     response = requests.get(url)
-    
-    # Check if the request was successful
+
+    if response.status_code == 200:
+        plant_data = response.json()
+
+        # Display plant information
+        click.echo(f"- {plant_data['guid']}")
+        click.echo(f"- {plant_data['name']}")
+        click.echo(f"- {plant_data['description']}")
+        click.echo(f"- {plant_data['status']}")
+        click.echo()
+
+        # Fetch plant data
+        url = f'{API_BASE_URL}/plants/{plant_id}/data/'
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            table = []
+            count = 1
+
+            for key, value in data.items():
+                parts = key.split('.')
+                if parts[0] == 'response':
+                    parts.pop(0)
+                full_key = '.'.join(parts)
+
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        full_sub_key = f"{full_key}.{sub_key}"
+                        # Apply bright green color to the value
+                        colored_value = click.style(str(sub_value), fg='bright_green')
+                        table.append([count, full_sub_key, colored_value])
+                        count += 1
+                else:
+                    # Apply bright green color to the value
+                    colored_value = click.style(str(value), fg='bright_green')
+                    table.append([count, full_key, colored_value])
+                    count += 1
+
+            # Print the table using tabulate without Click's echo, as echo might interfere with tabulate's formatting
+            print(tabulate(table, headers=['', 'FIELD', 'VALUE'], tablefmt='plain'))
+        else:
+            # Handle errors with styled message
+            click.echo(click.style(f'Failed to fetch data for plant ID {plant_id}. Response Code: {response.status_code}', fg='red'))
+    else:
+        # Handle errors with styled message
+        click.echo(click.style(f'Failed to fetch plant information for plant ID {plant_id}. Response Code: {response.status_code}', fg='red'))
+
+@cli.command('watch-package')
+@click.argument('package_id', type=int, required=True)
+def watch_package(package_id):
+    """Watch a specific package by ID."""
+    url = f'{API_BASE_URL}/package/{package_id}/'
+    response = requests.get(url)
+
     if response.status_code == 200:
         data = response.json()
 
-        # Prepare the table content
+        # Display package information
+        click.echo(f"- {data['package_guid']}")
+        click.echo(f"- {data['package_name']}")
+        click.echo(f"- {data['package_description']}")
+        click.echo(f"- {data['package_status']}")
+        click.echo()
+
+        # Display table with pick data
         table = []
         count = 1
-        for key, value in data.items():
-            # Remove "response" from the beginning of the key if it's there
-            display_key = key.replace("response.", "") if key.startswith("response") else key
+        for pick_id, pick_data in data['picks'].items():
+            plant_id = pick_data['plant_id']
+            for key, value in pick_data['data'].items():
+                color = 'blue' if plant_id % 2 != 1 else None
+                table.append([count, click.style(str(plant_id), fg=color), key, click.style(str(value), fg='bright_green')])
+                count += 1
 
-            # Apply cute green color style to the value
-            colored_value = click.style(str(value), fg='bright_green')  # Use 'green' or 'bright_green'
-
-            table.append([count, display_key, colored_value])
-            count += 1
-
-        # Display the table
-        click.echo(tabulate(table, headers=['COUNT', 'FIELDNAME', 'FIELDVALUE'], tablefmt='plain'))
+        # Print the table with aligned fields
+        click.echo(tabulate(table, headers=['', 'PLANT', 'FIELD', 'VALUE'], tablefmt='plain', colalign=("right", "right", "left", "left")))
     else:
-        click.echo(click.style(f'Failed to fetch data for plant ID {plant_id}. Response Code: {response.status_code}', fg='red'))
+        click.echo(click.style(f'Failed to fetch data for package ID {package_id}. Response Code: {response.status_code}', fg='red'))
 
-@cli.command('logs-plants')
+@cli.command('log-plants')
 @click.argument('plant_ids', type=str)
 @click.argument('numback', type=int)
 def plant_logs(plant_ids, numback):
@@ -166,8 +426,6 @@ def plant_logs(plant_ids, numback):
 
     # Colors for alternating log entries
     log_colors = ['cyan', 'green']
-    # List of colors for plants
-    plant_colors = ['yellow', 'magenta', 'blue', 'red']  # Extend this list as needed
 
     for index, hit in enumerate(data['hits']['hits']):
         timestamp = hit['_source']['timestamp']
@@ -177,24 +435,24 @@ def plant_logs(plant_ids, numback):
         # Styling timestamp and beat ID with the chosen log color
         styled_timestamp = click.style(f"Timestamp: {timestamp}", fg=log_color)
         styled_beat_id = click.style(f"Beat ID: {beat_id}", fg=log_color)
-        print(f"{styled_timestamp}, {styled_beat_id}\nResponses:")
+        print(f"{styled_timestamp}, {styled_beat_id}\nResponse:")
 
-        for plant_index, response in enumerate(hit['_source']['responses']):
-            # Sequentially assign colors to plants based on their order
-            plant_color = plant_colors[plant_index % len(plant_colors)]
+        # Assuming the response now directly contains the plant log details
+        response = hit['_source']['response']
+        plant_color = 'yellow'  # You can change this as needed or make it dynamic
 
-            # Print each key-value pair within the response, applying color to the plant details
-            for key, value in response.items():
-                if key in ['plant_id', 'plant_name']:
-                    styled_value = click.style(f"{key}: '{value}'", fg=plant_color)
-                    print(f"  {styled_value}", end=', ')
-                else:
-                    print(f"{key}: {value}", end=', ')
-            print("\n")  # Finish the line after each plant response
+        # Print each key-value pair within the response, applying color to the plant details
+        for key, value in response.items():
+            if key in ['plant_id', 'plant_name']:
+                styled_value = click.style(f"{key}: '{value}'", fg=plant_color)
+                print(f"  {styled_value}", end=', ')
+            else:
+                print(f"{key}: {value}", end=', ')
+        print("\n")  # Finish the line after each plant response
 
-       # print("\n" + "-"*40 + "\n")
+        # print("\n" + "-"*40 + "\n")
 
-@cli.command('logs-packages')
+@cli.command('log-packages')
 @click.argument('package_ids', type=str)
 @click.argument('numback', type=int)
 def package_logs(package_ids, numback):
@@ -234,9 +492,9 @@ def package_logs(package_ids, numback):
                         print(f"      {key}: {value}")
             print("")  # Extra newline for spacing between packages
 
-@cli.command('collect')
+@cli.command('start')
 @click.argument('plant_id', type=int)
-def collect(plant_id):
+def start(plant_id):
     """Enable data collection for a plant."""
     url = f'{API_BASE_URL}/plants/{plant_id}/update/'
     update_data = {"collect": 1}
@@ -258,186 +516,393 @@ def stop(plant_id):
     else:
         click.echo(f"Failed to disable data collection for plant ID {plant_id}. Status code: {response.status_code}, Response: {response.text}")
 
-@cli.command('list-packages')
-def list_packages():
-    """Listar todos los paquetes disponibles."""
-    url = f'{API_BASE_URL}/packages/'
-    response = requests.get(url)
-    data = response.json()
+@cli.command('on')
+@click.argument('worker_id', type=int)
+def on(worker_id):
+    """Enable data collection for a worker."""
+    url = f'{API_BASE_URL}/workers/{worker_id}/update/'
+    update_data = {"status": 1}
+    response = requests.patch(url, json=update_data)
+    if response.status_code in [200, 204]:
+        click.echo(f"Data collection enabled for worker ID {worker_id}.")
+    else:
+        click.echo(f"Failed to enable data collection for worker ID {worker_id}. Status code: {response.status_code}, Response: {response.text}")
 
-    packages = data
+@cli.command('off')
+@click.argument('worker_id', type=int)
+def off(worker_id):
+    """Disable data collection for a worker."""
+    url = f'{API_BASE_URL}/workers/{worker_id}/update/'
+    update_data = {"status": 0}
+    response = requests.patch(url, json=update_data)
+    if response.status_code in [200, 204]:
+        click.echo(f"Data collection disabled for worker ID {worker_id}.")
+    else:
+        click.echo(f"Failed to disable data collection for worker ID {worker_id}. Status code: {response.status_code}, Response: {response.text}")
+
+@cli.command('enable')
+@click.argument('action_id', type=int)
+def enable_action(action_id):
+    """Enable an action."""
+    url = f'{API_BASE_URL}/actions/{action_id}/'
+    update_data = {"status": 1}  # Set status to 'ON'
+    response = requests.patch(url, json=update_data)
+    if response.status_code in [200, 204]:
+        click.echo(f"Action ID {action_id} enabled.")
+    else:
+        click.echo(f"Failed to enable action ID {action_id}. Status code: {response.status_code}, Response: {response.text}")
+
+@cli.command('disable')
+@click.argument('action_id', type=int)
+def disable_action(action_id):
+    """Disable an action."""
+    url = f'{API_BASE_URL}/actions/{action_id}/'
+    update_data = {"status": 0}  # Set status to 'OFF'
+    response = requests.patch(url, json=update_data)
+    if response.status_code in [200, 204]:
+        click.echo(f"Action ID {action_id} disabled.")
+    else:
+        click.echo(f"Failed to disable action ID {action_id}. Status code: {response.status_code}, Response: {response.text}")
+
+@cli.command('list-workers')
+def list_workers():
+    """List all workers with associated plant and paths counts."""
+    url = f'{API_BASE_URL}/workers/'
+    response = requests.get(url)
+    workers_data = response.json()
 
     table = []
-    for package in packages:
-        table.append([package['id'], package['name'], package['unique_plants_count'], package['unique_api_fields_count']])
+    for worker in workers_data:
 
-    headers = ['ID', 'Nombre', 'PLANTS', 'FIELDS']
+        if worker['resume'] == 'OFF':
+            status = click.style(worker['resume'])
+        elif worker['resume'] == 'DOWN':
+            status = click.style(worker['resume'], fg='red')
+        elif worker['resume'] == 'STOP':
+            status = click.style(worker['resume'], fg='yellow')
+        elif worker['resume'] == 'ONLINE':
+            status = click.style(worker['resume'], fg='cyan')
+
+        worker_id = worker['id']
+        worker_name = worker['name']
+        plants_count = len(worker['package']['picks'])
+        paths_count = sum(len(pick['paths']) for pick in worker['package']['picks'])
+        since = worker['since']
+        table.append([worker_id, worker_name, plants_count, paths_count, status, since])
+
+    headers = ['ID', 'NAME', 'PLANTS', 'FIELDS', 'STATUS', 'SINCE']
     click.echo(tabulate(table, headers=headers, tablefmt='plain'))
 
+@cli.command('add-worker')
+def create_worker():
+    """Create a new worker."""
+    name = click.prompt('Enter worker name')
+    description = click.prompt('Enter worker description')
+    url = f'{API_BASE_URL}/workers/create/'
+    data = {
+        'name': name,
+        'description': description
+    }
+    response = requests.post(url, json=data)
+    if response.ok:
+        click.echo("Worker created successfully.")
+    else:
+        click.echo("Failed to create worker.")
 
-@cli.command('add-package')
-@click.option('--name', prompt='Nombre del paquete', help='Nombre del paquete')
-@click.option('--description', prompt='Descripción del paquete', help='Descripción del paquete')
-@click.option('--plant-ids', prompt='IDs de las plantas (separados por coma)', help='IDs de las plantas separados por coma')
-def add_package(name, description, plant_ids):
-    """Agregar un nuevo paquete con los campos especificados."""
-    try:
-        plant_ids = [int(plant_id.strip()) for plant_id in plant_ids.split(',')]
-    except ValueError:
-        click.echo("Por favor, ingresa solo números enteros separados por comas para los IDs de las plantas.")
+
+@cli.command('edit-worker')
+@click.argument('id', type=int)
+def edit_worker(id):
+    """Update an existing worker's name and description."""
+    click.echo("Fetching current worker details...")
+    get_url = f'{API_BASE_URL}/workers/{id}/'
+    get_response = requests.get(get_url)
+    if not get_response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {id}.")
         return
 
-    all_picks = []
+    worker_data = get_response.json()
+    click.echo(f"Current worker name: {worker_data['name']}")
+    click.echo(f"Current worker description: {worker_data['description']}")
 
-    for plant_id in plant_ids:
-        fields = get_plant_data(plant_id)
-        if not fields:
-            click.echo(f"No se encontraron datos para la planta con ID {plant_id}.")
-            continue
+    name = click.prompt('Enter new worker name', default=worker_data['name'])
+    description = click.prompt('Enter new worker description', default=worker_data['description'])
 
-        pick_data = {'plant': plant_id, 'api_fields': []}
-        click.echo(f"Ingrese los detalles para el Pick asociado a la planta {plant_id}:")
-
-        while True:
-            field_name = click.prompt(f"Nombre del campo para la planta {plant_id}", default='', show_default=False)
-            if not field_name:
-                break
-
-            if field_exists(field_name, fields):
-                pick_data['api_fields'].append({'name': field_name})
-            else:
-                click.echo(f"El campo '{field_name}' no existe en la planta {plant_id}. Intente nuevamente.")
-
-        if pick_data['api_fields']:
-            pick_id = create_pick(pick_data)
-            if pick_id:
-                all_picks.append(pick_id)
-
-    if all_picks:
-        package_id = create_package(name, description, all_picks)
-        if package_id:
-            click.echo(f"Package creado exitosamente con ID {package_id}.")
+    update_url = f'{API_BASE_URL}/workers/{id}/update/'
+    update_data = {'name': name, 'description': description}
+    update_response = requests.patch(update_url, json=update_data)
+    if update_response.ok:
+        click.echo("Worker updated successfully.")
     else:
-        click.echo("No se crearon Picks. Abortando la creación del paquete.")
+        click.echo("Failed to update worker.")
 
-def create_pick(pick_data):
-    """Crea un Pick y devuelve su ID."""
-    url = f'{API_BASE_URL}/picks/add/'
-    response = requests.post(url, json={'plant': pick_data['plant'], 'api_fields': pick_data['api_fields']})
-    if response.status_code in [200, 201]:  # Asumiendo que el código de estado exitoso puede ser 200 o 201
-        return response.json().get('id')
+
+@cli.command('edit-package')
+@click.argument('worker_id', type=int)
+def edit_package(worker_id):
+    """Update the package of a worker's name and description."""
+    click.echo("Fetching current package details...")
+    get_url = f'{API_BASE_URL}/workers/{worker_id}/'
+    get_response = requests.get(get_url)
+    if not get_response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {worker_id}.")
+        return
+
+    worker_data = get_response.json()
+    package_data = worker_data['package']
+    click.echo(f"Current package name: {package_data['name']}")
+    click.echo(f"Current package description: {package_data['description']}")
+
+    name = click.prompt('Enter new package name', default=package_data['name'])
+    description = click.prompt('Enter new package description', default=package_data['description'])
+
+    update_url = f'{API_BASE_URL}/workers/{worker_id}/update/'
+    update_data = {
+        'package': {
+            'name': name,
+            'description': description
+        }
+    }
+    update_response = requests.patch(update_url, json=update_data)
+    if update_response.ok:
+        click.echo("Package updated successfully.")
     else:
-        click.echo(f"Error al crear Pick para la planta {pick_data['plant']}: {response.status_code}")
-        return None
+        click.echo("Failed to update package.")
 
-def create_package(name, description, pick_ids):
-    """Crea un Package con los Picks dados y devuelve su ID."""
-    url = f'{API_BASE_URL}/packages/add/'
-    response = requests.post(url, json={'name': name, 'description': description, 'picks': pick_ids})
-    if response.status_code in [200, 201]:  # Asumiendo que el código de estado exitoso puede ser 200 o 201
-        return response.json().get('id')
+@cli.command('add-pick')
+@click.argument('worker_id', type=int)
+def add_pick(worker_id):
+    """Add a new pick to a worker."""
+    click.echo("Fetching current picks...")
+    get_url = f'{API_BASE_URL}/workers/{worker_id}/'
+    get_response = requests.get(get_url)
+    if not get_response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {worker_id}.")
+        return
+
+    worker_data = get_response.json()
+    existing_plant_ids = [pick['plant_id'] for pick in worker_data['package']['picks']]
+
+    plant_id = click.prompt('Enter plant ID')
+    if int(plant_id) in existing_plant_ids:
+        click.echo(f"A pick with plant ID {plant_id} already exists for this worker.")
+        return
+
+    paths = []
+    while True:
+        path = click.prompt('Enter path (leave empty to finish)', default='')
+        if not path:
+            break
+        paths.append(path)
+
+    url = f'{API_BASE_URL}/workers/{worker_id}/update/'
+    data = {
+        'picks': [
+            {
+                'plant_id': int(plant_id),
+                'paths': paths
+            }
+        ]
+    }
+    response = requests.put(url, json=data)
+    if response.ok:
+        click.echo("Pick added successfully.")
     else:
-        click.echo(f"Error al crear Package '{name}': {response.status_code}")
-        return None
+        click.echo("Failed to add pick.")
 
-def get_plant_data(plant_id):
-    """Obtiene los nombres de los campos del último log de una planta específica, incluyendo campos anidados."""
-    url = f'{API_BASE_URL}/logs/{plant_id}/1/'
+@cli.command('edit-pick')
+@click.argument('worker_id', type=int)
+def edit_pick(worker_id):
+    """Edit an existing pick of a worker."""
+    click.echo("Fetching current pick details...")
+    get_url = f'{API_BASE_URL}/workers/{worker_id}/'
+    get_response = requests.get(get_url)
+    if not get_response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {worker_id}.")
+        return
+
+    worker_data = get_response.json()
+    picks_data = worker_data['package']['picks']
+    if not picks_data:
+        click.echo("No picks found for this worker.")
+        return
+
+    # Displaying picks with a count for user to select
+    for i, pick in enumerate(picks_data, start=1):
+        click.echo(f"Pick #{i}: Plant ID {pick['plant_id']}")
+
+    pick_number = click.prompt('Enter the number of the pick to edit', type=int)
+    if pick_number > len(picks_data) or pick_number < 1:
+        click.echo(f"Invalid pick number. Please enter a number between 1 and {len(picks_data)}.")
+        return
+
+    # Selecting the pick based on user input
+    current_pick = picks_data[pick_number - 1]
+    click.echo(f"Editing pick #{pick_number} for plant ID {current_pick['plant_id']}:")
+
+    # Editing paths within the selected pick
+    for i, path in enumerate(current_pick['paths'], start=1):
+        new_path = click.prompt(f"Enter new path for Pick #{pick_number} Path #{i} (leave empty to keep as is)", default=path)
+        if new_path:  # Only update if user enters something
+            current_pick['paths'][i - 1] = new_path
+
+    # Optionally, ask for new paths to be added to the pick
+    while True:
+        new_path = click.prompt("Enter new path for a new Pick (leave empty to finish)", default='')
+        if not new_path:
+            click.echo("No new paths entered. Exiting...")
+            break
+        current_pick['paths'].append(new_path)
+
+    # Updating the pick in the API
+    url = f'{API_BASE_URL}/workers/{worker_id}/update/'
+    data = {
+        'picks': [
+            {
+                'plant_id': current_pick['plant_id'],
+                'paths': current_pick['paths']
+            }
+        ]
+    }
+    response = requests.put(url, json=data)
+    if response.ok:
+        click.echo(f"Pick #{pick_number} edited successfully.")
+    else:
+        click.echo("Failed to edit pick.")
+
+@cli.command('remove-pick')
+@click.argument('worker_id', type=int)
+def remove_pick(worker_id):
+    """Remove a pick from a worker."""
+    click.echo("Fetching current pick details...")
+    get_url = f'{API_BASE_URL}/workers/{worker_id}/'
+    get_response = requests.get(get_url)
+    if not get_response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {worker_id}.")
+        return
+
+    worker_data = get_response.json()
+    picks_data = worker_data['package']['picks']
+    if not picks_data:
+        click.echo("No picks found for this worker.")
+        return
+
+    count = click.prompt('Enter the count of the pick to remove', type=int)
+    if count > len(picks_data):
+        click.echo(f"Invalid pick count. Worker has only {len(picks_data)} picks.")
+        return
+
+    plant_id = picks_data[count - 1]['plant_id']
+    click.confirm(f"Are you sure you want to remove pick #{count} with plant ID {plant_id}?", abort=True)
+
+    url = f'{API_BASE_URL}/workers/{worker_id}/remove-pick/'
+    data = {'plant_id': plant_id}
+    response = requests.put(url, json=data)
+    if response.ok:
+        click.echo("Pick removed successfully.")
+    else:
+        click.echo("Failed to remove pick.")
+
+@cli.command('watch-worker')
+@click.argument('workerid', type=int)
+def watch_worker(workerid):
+    """Display detailed information about a worker, with each pick in a new section below."""
+    url = f'{API_BASE_URL}/workers/{workerid}/'
     response = requests.get(url)
-    if response.status_code == 200:
-        data = response.json()
-        hits = data.get('hits', {}).get('hits', [])
-        if hits:
-            plant_responses = hits[0].get('_source', {}).get('responses', [])
-            for response in plant_responses:
-                if str(response.get('plant_id')) == str(plant_id):
-                    return extract_fields(response.get('response', {}))
-    else:
-        click.echo(f"Error al obtener datos de la planta {plant_id}: {response.status_code}")
-        return set()
-
-def extract_fields(data, parent_key=''):
-    """Extrae todos los campos, incluyendo anidados, de un objeto de datos."""
-    fields = set()
-    for key, value in data.items():
-        full_key = f'{parent_key}.{key}' if parent_key else key
-        if isinstance(value, dict):
-            fields.update(extract_fields(value, full_key))
-        else:
-            fields.add(full_key)
-    return fields
-
-def field_exists(field_name, fields):
-    """Verifica si el campo especificado existe, considerando campos anidados."""
-    return field_name in fields
-
-def get_field_color(field_id):
-    """Obtiene el color del campo."""
-    field_url = f'{API_BASE_URL}/api-fields/{field_id}/'
-    response = requests.get(field_url)
-    if response.status_code == 200:
-        return 'cyan'
-    else:
-        return 'magenta'
-
-@cli.command('watch-package')
-@click.argument('package_id', type=int)
-def watch_package(package_id):
-    """Consulta un paquete y muestra las plantas y sus campos asociados."""
-    package_url = f'{API_BASE_URL}/packages/{package_id}/'
-    package_response = requests.get(package_url)
-    if package_response.status_code != 200:
-        click.echo(f'Error al consultar el paquete. Código de estado: {package_response.status_code}')
-        return
-    package_data = package_response.json()
-
-    picks = package_data.get('picks', [])
-    if not picks:
-        click.echo('No se encontraron picks asociados al paquete.')
+    if not response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {workerid}.")
         return
 
-    for pick_id in picks:
-        pick_url = f'{API_BASE_URL}/picks/{pick_id}/'
-        pick_response = requests.get(pick_url)
-        if pick_response.status_code != 200:
-            click.echo(f'Error al consultar el pick {pick_id}. Código de estado: {pick_response.status_code}')
-            continue
-        pick_data = pick_response.json()
+    worker_data = response.json()
 
-        plant_id = pick_data.get('plant')
-        api_fields = pick_data.get('api_fields', [])
+    # Worker details
+    worker_details = [
+        ["Name:", worker_data['name']],
+        ["", ""],
+        ["Unit Description:", worker_data['description']],
+        ["", ""],
+        ["Data Description:", worker_data['package']['description']],
+        ["", ""],
+        ["", ""],
+    ]
 
-        # Consultar la información de la planta para obtener el nombre
-        plant_url = f'{API_BASE_URL}/plants/{plant_id}/'
+    # Print worker details
+    click.echo(tabulate(worker_details, tablefmt="plain"))
+
+    # Picks details
+    pick_table = []
+    pick_number = 1
+    for pick in worker_data['package']['picks']:
+        plant_id = pick['plant_id']
+        plant_url = f"{API_BASE_URL}/plants/{plant_id}/"
         plant_response = requests.get(plant_url)
-        if plant_response.status_code != 200:
-            click.echo(f'Error al consultar la planta {plant_id}. Código de estado: {plant_response.status_code}')
-            continue
-        plant_data = plant_response.json()
-        plant_name = plant_data.get('name', f'Planta {plant_id}')  # Usar el nombre de la planta, o "Planta {plant_id}" como fallback
 
-        plant_fields = get_plant_data(plant_id)
-        if not plant_fields:
-            click.echo(f'No se encontraron datos para la planta con ID {plant_id}.')
-            continue
+        if plant_response.ok:
+            plant_data = plant_response.json()
+            plant_name = plant_data['name']
+            plant_status = plant_data.get('status', 0)
+            plant_collect = plant_data.get('collect', 0)
 
-        # Mostrar nombre de la planta
-        click.echo(f'{plant_name}:')
+            if plant_status == 1 and plant_collect == 1:
+                plant_name_colored = click.style(plant_name, fg='cyan')
+            elif plant_status == 1:
+                plant_name_colored = click.style(plant_name, fg='yellow')
+            else:
+                plant_name_colored = click.style(plant_name, fg='red')
+        else:
+            plant_name_colored = click.style("NOT FOUND", fg='red')
 
-        for field in api_fields:
-            field_name = field.get('name')
-            color = 'cyan' if field_exists(field_name, plant_fields) else 'magenta'
-            click.echo(click.style(f'  - {field_name}', fg=color))
+        pick_table.append([f"Pick N°{pick_number}:", plant_name_colored])
+        pick_number += 1
+        pick_table.extend([["", path] for path in pick['paths']])
+        pick_table.append(["", ""])
+    # Print pick details
+    click.echo(tabulate(pick_table, tablefmt="plain"))
 
+@cli.command('edit-picks')
+@click.argument('worker_id', type=int)
+def edit_picks(worker_id):
+    """Edit the picks of a worker's package in YAML format with specific spacing and order."""
+    # Fetch current worker details to get picks
+    get_url = f'{API_BASE_URL}/workers/{worker_id}/'
+    get_response = requests.get(get_url)
 
-@cli.command('remove-package')
-@click.argument('package_id', type=int)
-def delete_package(package_id):
-    """Elimina un paquete existente utilizando su package_id."""
-    delete_url = f'{API_BASE_URL}/packages/{package_id}/delete/'
-    response = requests.delete(delete_url)
-    if response.status_code in [200, 204]:  # Asumiendo que 200 o 204 son respuestas exitosas para una operación de eliminación
-        click.echo(f"Paquete con ID {package_id} eliminado exitosamente.")
+    if not get_response.ok:
+        click.echo(f"Failed to fetch details for worker with ID {worker_id}.")
+        return
+
+    worker_data = get_response.json()
+    picks = worker_data['package']['picks']
+
+    # Remove 'id' from picks and ensure 'plant_id' is above 'paths'
+    formatted_picks = [{'plant_id': pick['plant_id'], 'paths': pick['paths']} for pick in picks]
+
+    # Convert picks to YAML format with desired structure and spacing
+    picks_yaml = yaml.dump(formatted_picks, sort_keys=False, default_flow_style=False, indent=2)
+
+    # Add extra newline between items for clarity
+    picks_yaml = picks_yaml.replace('\n- ', '\n\n- ')
+
+    # Open text editor with current picks data in YAML format
+    edited_picks_yaml = click.edit(text=picks_yaml, require_save=False, extension='.yml')
+
+    if edited_picks_yaml is None:
+        click.echo("No changes made to picks.")
+        return
+
+    # Load edited YAML back into Python object
+    try:
+        edited_picks = yaml.safe_load(edited_picks_yaml)
+    except yaml.YAMLError as e:
+        click.echo(f"Error parsing YAML: {e}")
+        return
+
+    # Update worker's package picks
+    update_url = f'{API_BASE_URL}/workers/{worker_id}/update/'
+    update_data = {"picks": edited_picks}
+    update_response = requests.patch(update_url, json=update_data)
+
+    if update_response.ok:
+        click.echo("Package picks updated successfully.")
     else:
-        click.echo(f"Error al eliminar el paquete con ID {package_id}. Código de estado: {response.status_code}")
-
+        click.echo(f"Failed to update package picks. Response: {update_response.text}")
